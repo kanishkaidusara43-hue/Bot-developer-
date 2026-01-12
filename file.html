@@ -1,0 +1,241 @@
+/******************************************************************************************
+  ONE-FILE WHATSAPP-BOT-SAAS  –  production-ready
+  save as app.js  →  node app.js
+******************************************************************************************/
+require('dotenv').config();
+const express   = require('express');
+const mongoose  = require('mongoose');
+const bcrypt    = require('bcryptjs');
+const jwt       = require('jsonwebtoken');
+const cors      = require('cors');
+const axios     = require('axios');
+const path      = require('path');
+const http      = require('http');
+const WebSocket = require('ws');
+
+/* ==========================================
+   1. CONFIG
+========================================== */
+const PORT        = process.env.PORT || 5000;
+const MONGO       = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/wabot';
+const JWT_SECRET  = process.env.JWT_SECRET || 'super-secret';
+const AD_LINKS    = [
+  "https://otieu.com/4/10313241","https://otieu.com/4/10313225","https://otieu.com/4/10313229",
+  "https://otieu.com/4/10313238","https://otieu.com/4/10313249","https://otieu.com/4/10313224",
+  "https://otieu.com/4/10313237","https://otieu.com/4/10313237","https://otieu.com/4/10313228",
+  "https://otieu.com/4/10313226","https://otieu.com/4/10313240","https://otieu.com/4/10313223",
+  "https://otieu.com/4/10313248","https://otieu.com/4/10313248","https://otieu.com/4/10313243",
+  "https://otieu.com/4/10313245","https://otieu.com/4/10313236","https://otieu.com/4/10313230"
+];
+
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+app.use(cors({ origin:true, credentials:true }));
+app.use(express.json());
+app.use(express.static(path.join(__dirname,'client','build')));
+
+/* ==========================================
+   2. MONGOOSE MODELS
+========================================== */
+const userSchema = new mongoose.Schema({
+  username:{type:String,unique:true,trim:true},
+  email:{type:String,unique:true,lowercase:true},
+  password:String,
+  coins:{type:Number,default:0},
+  adClickCount:{type:Number,default:0},
+  lastAdClick:Date,
+  adLinkIndex:{type:Number,default:0},
+  role:{type:String,enum:['user','admin'],default:'user'},
+  demoUsage:{todayCount:{type:Number,default:0},lastReset:Date}
+},{timestamps:true});
+userSchema.pre('save',async function(){ if(this.isModified('password')) this.password = await bcrypt.hash(this.password,10); });
+userSchema.methods.compare = async function(pwd){ return bcrypt.compare(pwd,this.password); };
+
+const botSchema = new mongoose.Schema({
+  name:String, description:String,
+  owner:{type:mongoose.Schema.Types.ObjectId,ref:'User'},
+  whatsappNumber:String, whatsappBusinessId:String, accessToken:String,
+  status:{type:String,enum:['active','paused','pending'],default:'pending'},
+  autoReplies:[{keyword:String,response:String,caseSensitive:Boolean}],
+  welcomeMessage:{type:String,default:'Welcome!'},
+  businessHours:{
+    enabled:Boolean, startTime:String, endTime:String, timezone:String, offHoursMessage:String
+  },
+  messageQuota:{type:Number,default:1000}, messagesSent:{type:Number,default:0},
+  cost:Number
+},{timestamps:true});
+
+const adClickSchema = new mongoose.Schema({
+  user:{type:mongoose.Schema.Types.ObjectId,ref:'User'}, adLink:String, adIndex:Number,
+  coinsEarned:{type:Number,default:10}, clickedAt:{type:Date,default:Date.now},
+  timeSpent:Number, ipAddress:String, status:{type:String,enum:['pending','validated','rejected'],default:'pending'}
+});
+
+const User     = mongoose.model('User',userSchema);
+const Bot      = mongoose.model('Bot',botSchema);
+const AdClick  = mongoose.model('AdClick',adClickSchema);
+
+/* ==========================================
+   3. JWT & AUTH MIDDLEWARE
+========================================== */
+const sign = id => jwt.sign({id},JWT_SECRET,{expiresIn:'7d'});
+const auth = async (req,res,next)=>{
+  const hdr = req.headers.authorization;
+  if(!hdr) return res.status(401).json({success:false,msg:'no token'});
+  try{
+    const {id} = jwt.verify(hdr.split(' ')[1],JWT_SECRET);
+    req.user = await User.findById(id).select('-password');
+    next();
+  }catch(e){ res.status(401).json({success:false,msg:'bad token'}); }
+};
+
+/* ==========================================
+   4. WHATSAPP HELPER
+========================================== */
+class WA {
+  static async send(token,phoneId,to,text){
+    await axios.post(`https://graph.facebook.com/v18.0/${phoneId}/messages`,
+      { messaging_product:'whatsapp', to, type:'text', text:{body:text} },
+      { headers:{Authorization:`Bearer ${token}`, 'Content-Type':'application/json'} }
+    );
+  }
+  static async processIncoming(bot,msg){
+    const txt = (msg.text||{}).body||'';
+    const from = msg.from;
+    /* business hours */
+    if(bot.businessHours?.enabled){
+      const now = new Date(), cur = now.getHours()*60+now.getMinutes();
+      const [sh,sm] = bot.businessHours.startTime.split(':').map(Number);
+      const [eh,em] = bot.businessHours.endTime.split(':').map(Number);
+      const start = sh*60+sm, end = eh*60+em;
+      if(cur<start||cur>end){
+        await this.send(bot.accessToken,bot.whatsappBusinessId,from,bot.businessHours.offHoursMessage); return;
+      }
+    }
+    /* auto replies */
+    for(const r of bot.autoReplies){
+      const kw = r.caseSensitive ? r.keyword : r.keyword.toLowerCase();
+      const m  = r.caseSensitive ? txt : txt.toLowerCase();
+      if(m.includes(kw)){
+        await this.send(bot.accessToken,bot.whatsappBusinessId,from,r.response); return;
+      }
+    }
+    /* welcome */
+    await this.send(bot.accessToken,bot.whatsappBusinessId,from,bot.welcomeMessage);
+  }
+}
+
+/* ==========================================
+   5. ROUTES
+========================================== */
+/* 5a. AUTH */
+app.post('/api/auth/register', async (req,res)=>{
+  const {username,email,password} = req.body;
+  if(await User.findOne({$or:[{email},{username}]})) return res.status(400).json({success:false,msg:'exists'});
+  const user = await User.create({username,email,password});
+  res.json({success:true,token:sign(user._id),user:{id:user._id,username,email,coins:user.coins}});
+});
+app.post('/api/auth/login', async (req,res)=>{
+  const {email,password} = req.body;
+  const user = await User.findOne({email});
+  if(!user||!(await user.compare(password))) return res.status(401).json({success:false,msg:'bad creds'});
+  res.json({success:true,token:sign(user._id),user:{id:user._id,username:user.username,email,coins:user.coins}});
+});
+app.get('/api/auth/profile', auth, async (req,res)=> res.json({success:true,data:req.user}));
+
+/* 5b. BOTS */
+app.post('/api/bots', auth, async (req,res)=>{
+  if(req.user.coins<100) return res.status(400).json({success:false,msg:'need 100 coins'});
+  const bot = await Bot.create({...req.body,owner:req.user._id,cost:100});
+  await User.findByIdAndUpdate(req.user._id,{$inc:{coins:-100},$push:{bots:bot._id}});
+  res.json({success:true,data:bot});
+});
+app.get('/api/bots', auth, async (req,res)=> res.json({success:true,data:await Bot.find({owner:req.user._id})}));
+app.put('/api/bots/:id', auth, async (req,res)=>{
+  const bot = await Bot.findOneAndUpdate({_id:req.params.id,owner:req.user._id},req.body,{new:true});
+  if(!bot) return res.status(404).json({success:false,msg:'not found'});
+  res.json({success:true,data:bot});
+});
+app.delete('/api/bots/:id', auth, async (req,res)=>{
+  const bot = await Bot.findOneAndDelete({_id:req.params.id,owner:req.user._id});
+  if(!bot) return res.status(404).json({success:false,msg:'not found'});
+  await User.findByIdAndUpdate(req.user._id,{$pull:{bots:bot._id}});
+  res.json({success:true});
+});
+
+/* 5c. ADS */
+app.get('/api/ads/link', auth, async (req,res)=>{
+  const user = req.user;
+  const today = new Date(); today.setHours(0,0,0,0);
+  const clicks = await AdClick.countDocuments({user:user._id,clickedAt:{$gte:today}});
+  if(clicks>=18) return res.status(400).json({success:false,msg:'daily limit'});
+  if(user.lastAdClick && (Date.now()-user.lastAdClick.getTime())<5*60*1000)
+    return res.status(400).json({success:false,msg:'cooldown'});
+  const idx = user.adLinkIndex % AD_LINKS.length;
+  const link = AD_LINKS[idx];
+  await User.findByIdAndUpdate(user._id,{adLinkIndex:idx+1});
+  res.json({success:true,data:{adLink:link,adIndex:idx,todayClicks:clicks,maxDailyClicks:18}});
+});
+app.post('/api/ads/validate', auth, async (req,res)=>{
+  const {adIndex,timeSpent} = req.body;
+  if(timeSpent<8) return res.status(400).json({success:false,msg:'min 8s'});
+  const user = req.user;
+  await AdClick.create({user:user._id,adLink:AD_LINKS[adIndex],adIndex,timeSpent,ipAddress:req.ip,status:'validated'});
+  user.coins+=10; user.adClickCount+=1; user.lastAdClick=new Date();
+  await user.save();
+  res.json({success:true,msg:'coins added',data:{coinsEarned:10,newBalance:user.coins}});
+});
+app.get('/api/ads/stats', auth, async (req,res)=>{
+  const user = req.user;
+  const today = new Date(); today.setHours(0,0,0,0);
+  const clicks = await AdClick.countDocuments({user:user._id,clickedAt:{$gte:today}});
+  const total = await AdClick.aggregate([{$match:{user:user._id,status:'validated'}},{$group:{_id:null,total:{$sum:'$coinsEarned'}}}]);
+  res.json({success:true,data:{todayClicks:clicks,maxDailyClicks:18,totalClicks:await AdClick.countDocuments({user:user._id}),totalCoinsEarned:total[0]?.total||0,currentBalance:user.coins}});
+});
+
+/* 5d. DEMO BOT (websocket) */
+wss.on('connection',(ws)=>{
+  ws.send(JSON.stringify({from:'bot',text:'👋 Demo bot ready! Try "hi","hello","help" etc.'}));
+});
+app.post('/api/demo/message', async (req,res)=>{
+  const {message} = req.body;
+  if(!message) return res.status(400).json({success:false});
+  /* simple demo logic */
+  const low = message.toLowerCase().trim();
+  let reply = 'Thanks for your message! This is a demo response.';
+  if(low==='hi'||low==='hello') reply='Hello! 👋 I\'m a demo WhatsApp bot.';
+  if(low==='help') reply='🆘 Try: hi, hello, pricing, services';
+  if(low==='pricing') reply='💰 100 coins per bot. Earn coins by viewing ads!';
+  /* broadcast to all demo sockets */
+  wss.clients.forEach(c=>c.send(JSON.stringify({from:'user',text:message})));
+  setTimeout(()=>{
+    wss.clients.forEach(c=>c.send(JSON.stringify({from:'bot',text:reply})));
+  },1000);
+  res.json({success:true,reply});
+});
+
+/* 5e. ADMIN */
+app.get('/api/admin', auth, async (req,res)=>{
+  if(req.user.role!=='admin') return res.status(403).json({success:false,msg:'admin only'});
+  res.json({success:true,users:await User.find(),clicks:await AdClick.find().limit(100).sort('-clickedAt')});
+});
+
+/* ==========================================
+   6. REACT BUILD (catch-all)
+========================================== */
+app.get('*',(req,res)=> res.sendFile(path.join(__dirname,'client','build','index.html')));
+
+/* ==========================================
+   7. DB + SERVER START
+========================================== */
+(async()=>{
+  await mongoose.connect(MONGO);
+  /* seed admin */
+  if(!(await User.findOne({email:'admin@site.com'}))){
+    await User.create({username:'admin',email:'admin@site.com',password:'admin123',role:'admin',coins:9999});
+    console.log('Admin seeded: admin@site.com / admin123');
+  }
+  server.listen(PORT,()=>console.log(`🚀 Server ${PORT} | MongoDB ready`));
+})();
